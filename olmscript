@@ -1,0 +1,798 @@
+// ==UserScript==
+// @name         Hack olm
+// @namespace    http://tampermonkey.net/
+// @version      3.0
+// @description  Hack olm.vn
+// @match        *://*.olm.vn/*
+// @grant        none
+// @run-at       document-start
+// @downloadURL https://update.greasyfork.org/scripts/552562/Hack%20olm.user.js
+// @updateURL https://update.greasyfork.org/scripts/552562/Hack%20olm.meta.js
+// ==/UserScript==
+
+(function() {
+    'use strict';
+    const HOOK_CODE = `(() => {
+      if (window.__olmHooked) return; window.__olmHooked = true;
+
+      const tryParseJSON = (text) => { try { return JSON.parse(text); } catch { return null; } };
+      const looksLikeBase64 = (s) => typeof s === 'string' && s.length > 16 && /^[A-Za-z0-9+/=]+$/.test(s);
+      const collectContents = (obj, out) => {
+        if (!obj) return;
+        if (Array.isArray(obj)) { for (const it of obj) collectContents(it, out); return; }
+        if (typeof obj === 'object') {
+          for (const [k, v] of Object.entries(obj)) {
+            if (k === 'content' && looksLikeBase64(v)) out.push(v);
+            collectContents(v, out);
+          }
+        }
+      };
+
+      const postIfHasContents = (meta, text) => {
+        const json = tryParseJSON(text); if (!json) return;
+        const contents = []; collectContents(json, contents);
+        if (contents.length) {
+          window.postMessage({ type: 'OLM_SNIF_CONTENTS', meta, contents }, '*');
+        }
+      };
+
+      // XHR hook
+      (() => {
+        const origOpen = XMLHttpRequest.prototype.open;
+        const origSend = XMLHttpRequest.prototype.send;
+        const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+          this.__olm = { method, url, headers: {}, body: null };
+          try { this.addEventListener('load', () => {
+            if (this.responseType && this.responseType !== 'text') return;
+            postIfHasContents(this.__olm, this.responseText || '');
+          }); } catch {}
+          return origOpen.call(this, method, url, ...rest);
+        };
+        XMLHttpRequest.prototype.setRequestHeader = function(h, v) {
+          try { if (this.__olm) this.__olm.headers[h] = v; } catch {}
+          return origSetHeader.call(this, h, v);
+        };
+        XMLHttpRequest.prototype.send = function(body) {
+          try { if (this.__olm) this.__olm.body = body; } catch {}
+          return origSend.call(this, body);
+        };
+      })();
+
+      (() => {
+        const origFetch = window.fetch;
+        window.fetch = function(input, init) {
+            const method = (init && init.method) || (input && input.method) || 'GET';
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            const headers = (init && init.headers) || (input && input.headers) || {};
+            const body = (init && init.body) || (input && input.body) || null;
+            const meta = { method, url, headers, body };
+            const p = origFetch(input, init);
+            p.then(r => {
+                try {
+                    const c = r.clone();
+                    c.text().then(t => postIfHasContents(meta, t)).catch(() => {});
+                } catch {}
+            }).catch(() => {});
+            return p;
+        };
+      })();
+    })();`;
+
+    const inject = () => {
+        const s = document.createElement('script');
+        s.textContent = HOOK_CODE;
+        (document.head || document.documentElement).appendChild(s);
+        s.remove();
+    };
+    inject();
+
+    const state = { isVisible: true, items: [], originals: [], firstMeta: null };
+
+    let beautifierLoading = null;
+    function ensureBeautifier() {
+        if (window.html_beautify) return Promise.resolve();
+        if (beautifierLoading) return beautifierLoading;
+        beautifierLoading = new Promise((resolve) => {
+            const s = document.createElement('script');
+            s.src = 'https://cdn.jsdelivr.net/npm/js-beautify@1.14.11/js/lib/beautify-html.min.js';
+            s.async = true;
+            s.onload = () => resolve();
+            s.onerror = () => resolve();
+            document.head.appendChild(s);
+        });
+        return beautifierLoading;
+    }
+
+    let mathjaxLoading = null;
+    function ensureMathJax() {
+        if (window.MathJax && window.MathJax.typesetPromise) return Promise.resolve();
+        if (mathjaxLoading) return mathjaxLoading;
+        window.MathJax = {
+            tex: {
+                inlineMath: [["$","$"],["\\(","\\)"]],
+                displayMath: [["$$","$$"],["\\[","\\]"]],
+                processEscapes: true,
+                packages: { '[+]': ['mhchem'] }
+            },
+            loader: { load: ['[tex]/mhchem'] }
+        };
+        mathjaxLoading = new Promise((resolve) => {
+            const s = document.createElement('script');
+            s.src = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js';
+            s.async = true;
+            s.onload = () => resolve();
+            s.onerror = () => resolve();
+            document.head.appendChild(s);
+        });
+        return mathjaxLoading;
+    }
+
+    const utils = {
+        safeDecode(base64) {
+            try { return decodeURIComponent(escape(atob(base64))); } catch { return null; }
+        }
+    };
+
+    const fuzzyMatch = {
+        normalize(text) {
+            return text.toLowerCase()
+                .replace(/\s+/g, ' ')
+                .replace(/[^\w\s]/g, '')
+                .trim();
+        },
+        similarity(s1, s2) {
+            const n1 = this.normalize(s1);
+            const n2 = this.normalize(s2);
+            if (n1 === n2) return 1;
+            if (!n1 || !n2) return 0;
+            const len1 = n1.length;
+            const len2 = n2.length;
+            const maxLen = Math.max(len1, len2);
+            if (n1.includes(n2) || n2.includes(n1)) {
+                return 0.8 + (0.2 * Math.min(len1, len2) / maxLen);
+            }
+            const chars1 = new Set(n1.split(''));
+            const chars2 = new Set(n2.split(''));
+            const intersection = new Set([...chars1].filter(x => chars2.has(x)));
+            const union = new Set([...chars1, ...chars2]);
+            return intersection.size / union.size;
+        },
+        findBestMatch(searchText) {
+            const candidates = [];
+            const minLength = 3;
+            const walker = document.createTreeWalker(
+                document.body,
+                NodeFilter.SHOW_TEXT,
+                {
+                    acceptNode: (node) => {
+                        const text = node.textContent.trim();
+                        if (text.length < minLength) return NodeFilter.FILTER_REJECT;
+                        const parent = node.parentElement;
+                        if (!parent || parent.closest('#olm-answers-container')) return NodeFilter.FILTER_REJECT;
+                        return NodeFilter.FILTER_ACCEPT;
+                    }
+                }
+            );
+            let node;
+            while (node = walker.nextNode()) {
+                const text = node.textContent.trim();
+                const parent = node.parentElement;
+                if (parent) {
+                    candidates.push({ element: parent, text });
+                }
+            }
+            let bestMatch = null;
+            let bestScore = 0;
+            for (const candidate of candidates) {
+                const score = this.similarity(searchText, candidate.text);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = candidate.element;
+                }
+            }
+            return bestScore > 0.3 ? bestMatch : null;
+        }
+    };
+
+    function scrollToElement(element) {
+        if (!element) return false;
+        document.querySelectorAll('.olm-highlight').forEach(el => {
+            el.classList.remove('olm-highlight');
+        });
+        element.classList.add('olm-highlight');
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(() => {
+            element.classList.remove('olm-highlight');
+        }, 3000);
+        return true;
+    }
+
+    async function processAndAppend(htmlSnippets) {
+        await ensureBeautifier();
+        const beautify = window.html_beautify || ((s)=>s);
+        const options = {
+            indent_size: 2,
+            preserve_newlines: true,
+            max_preserve_newlines: 2,
+            wrap_line_length: 0,
+            content_unformatted: ['pre','code','textarea']
+        };
+        for (const html of htmlSnippets) {
+            const container = document.createElement('div');
+            container.innerHTML = html;
+            try {
+                state.originals.push(beautify(container.innerHTML, options));
+            } catch {}
+            const segments = [];
+            let current = document.createElement('div');
+            const pushCurrentIfAny = () => {
+                const s = current.innerHTML.trim();
+                if (s) segments.push(beautify(s, options));
+                current = document.createElement('div');
+            };
+            Array.from(container.childNodes).forEach((node) => {
+                if (node.nodeType === 1 && node.classList && node.classList.contains('exp')) {
+                    pushCurrentIfAny();
+                    return;
+                }
+                current.appendChild(node.cloneNode(true));
+            });
+            pushCurrentIfAny();
+            if (segments.length) {
+                state.items.push(...segments);
+            } else {
+                container.querySelectorAll('.exp').forEach(el => el.remove());
+                state.items.push(beautify(container.innerHTML, options));
+            }
+        }
+        ui.update();
+    }
+
+    window.addEventListener('message', (ev) => {
+        const msg = ev.data;
+        if (!msg || msg.type !== 'OLM_SNIF_CONTENTS') return;
+        if (!state.firstMeta) state.firstMeta = msg.meta || null;
+        const decoded = (msg.contents || []).map(utils.safeDecode).filter(Boolean);
+        if (!decoded.length) return;
+        processAndAppend(decoded);
+    }, false);
+
+    async function downloadWordFile(event) {
+        const button = event.target;
+        const originalText = button.textContent;
+        button.textContent = 'Đang xử lý...';
+        button.disabled = true;
+        try {
+            const match = window.location.pathname.match(/(\d+)$/);
+            if (!match || !match[0]) {
+                alert('Lỗi: Không tìm thấy ID chủ đề (dãy số ở cuối link) trong URL.');
+                throw new Error('Không tìm thấy ID chủ đề trong pathname.');
+            }
+            const id_cate = match[0];
+            button.textContent = 'Đang lấy link...';
+            const apiUrl = `https://olm.vn/download-word-for-user?id_cate=${id_cate}&showAns=1&questionNotApproved=0`;
+            const response = await fetch(apiUrl);
+            if (!response.ok) {
+                throw new Error(`Lỗi server OLM: ${response.statusText}`);
+            }
+            const data = await response.json();
+            if (!data || !data.file) {
+                throw new Error('Response JSON không hợp lệ hoặc không có link file.');
+            }
+            const fileUrl = data.file;
+            button.textContent = 'Đang tải về...';
+            const link = document.createElement('a');
+            link.href = fileUrl;
+            link.target = '_blank';
+            let filename = fileUrl.split('/').pop();
+            if (!filename || !filename.includes('.')) {
+                filename = `olm-answers-${id_cate}.docx`;
+            }
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        } catch (error) {
+            console.error('Lỗi khi tải file Word:', error);
+            alert(`Đã xảy ra lỗi: ${error.message}`);
+        } finally {
+            button.textContent = originalText;
+            button.disabled = false;
+        }
+    }
+
+    // BIẾN TOÀN CỤC: Đánh dấu người dùng đã resize
+    let hasUserResized = false;
+
+    const ui = {
+        el: {},
+
+        //resizer
+        setupResize() {
+            let isResizing = false;
+            let startX, startY, startW, startH;
+
+            const minW = 280, minH = 160;
+            const maxW = window.innerWidth * 0.92;
+            const maxH = window.innerHeight * 0.92;
+
+            const startResize = (e) => {
+                if (e.target.closest('a')) return;
+
+                hasUserResized = true; // ĐÁNH DẤU: người dùng đã tự resize
+
+                isResizing = true;
+                this.el.panel.classList.add('resizing');
+
+                startX = e.clientX || (e.touches && e.touches[0].clientX);
+                startY = e.clientY || (e.touches && e.touches[0].clientY);
+
+                const rect = this.el.panel.getBoundingClientRect();
+                startW = rect.width;
+                startH = rect.height;
+
+                document.addEventListener('mousemove', onResize);
+                document.addEventListener('touchmove', onResize, { passive: false });
+                document.addEventListener('mouseup', stopResize);
+                document.addEventListener('touchend', stopResize);
+
+                e.preventDefault();
+            };
+
+            const onResize = (e) => {
+                if (!isResizing) return;
+
+                const currentX = e.clientX || (e.touches && e.touches[0].clientX);
+                const currentY = e.clientY || (e.touches && e.touches[0].clientY);
+
+                const newW = Math.max(minW, Math.min(maxW, startW + (currentX - startX)));
+                const newH = Math.max(minH, Math.min(maxH, startH + (currentY - startY)));
+
+                this.el.panel.style.width = `${newW}px`;
+                this.el.panel.style.height = `${newH}px`;
+                this.el.panel.style.right = 'auto';
+                this.el.panel.style.bottom = 'auto';
+            };
+
+            const stopResize = () => {
+                if (!isResizing) return;
+                isResizing = false;
+                this.el.panel.classList.remove('resizing');
+
+                // LƯU KÍCH THƯỚC VÀO LOCALSTORAGE
+                const panel = this.el.panel;
+                const rect = panel.getBoundingClientRect();
+                localStorage.setItem('olm-panel-size', JSON.stringify({
+                    w: rect.width,
+                    h: rect.height,
+                    x: rect.left,
+                    y: rect.top
+                }));
+
+                document.removeEventListener('mousemove', onResize);
+                document.removeEventListener('touchmove', onResize);
+                document.removeEventListener('mouseup', stopResize);
+                document.removeEventListener('touchend', stopResize);
+            };
+
+            this.el.resize.addEventListener('mousedown', startResize);
+            this.el.resize.addEventListener('touchstart', startResize, { passive: false });
+        },
+
+        //drag
+        setupDrag() {
+            let isDragging = false;
+            let startX, startY, initialX, initialY;
+
+            const startDrag = (e) => {
+                if (e.target.classList.contains('olm-mini-resize') || e.target.closest('a')) return;
+
+                isDragging = true;
+                this.el.panel.classList.add('dragging');
+
+                startX = e.clientX || (e.touches && e.touches[0].clientX);
+                startY = e.clientY || (e.touches && e.touches[0].clientY);
+
+                const rect = this.el.panel.getBoundingClientRect();
+                initialX = rect.left;
+                initialY = rect.top;
+
+                document.addEventListener('mousemove', onDrag);
+                document.addEventListener('touchmove', onDrag, { passive: false });
+                document.addEventListener('mouseup', stopDrag);
+                document.addEventListener('touchend', stopDrag);
+
+                if (!e.target.closest('a')) {
+                    e.preventDefault();
+                }
+            };
+
+            const onDrag = (e) => {
+                if (!isDragging) return;
+
+                const currentX = e.clientX || (e.touches && e.touches[0].clientX);
+                const currentY = e.clientY || (e.touches && e.touches[0].clientY);
+                const dx = currentX - startX;
+                const dy = currentY - startY;
+
+                let newX = initialX + dx;
+                let newY = initialY + dy;
+
+                const maxX = window.innerWidth - this.el.panel.offsetWidth;
+                const maxY = window.innerHeight - this.el.panel.offsetHeight;
+                newX = Math.max(10, Math.min(newX, maxX - 10));
+                newY = Math.max(10, Math.min(newY, maxY - 10));
+
+                this.el.panel.style.left = `${newX}px`;
+                this.el.panel.style.top = `${newY}px`;
+                this.el.panel.style.right = 'auto';
+                this.el.panel.style.bottom = 'auto';
+            };
+
+            const stopDrag = () => {
+                if (!isDragging) return;
+                isDragging = false;
+                this.el.panel.classList.remove('dragging');
+
+                // LƯU VỊ TRÍ KHI KÉO
+                const panel = this.el.panel;
+                const rect = panel.getBoundingClientRect();
+                localStorage.setItem('olm-panel-size', JSON.stringify({
+                    w: rect.width,
+                    h: rect.height,
+                    x: rect.left,
+                    y: rect.top
+                }));
+
+                document.removeEventListener('mousemove', onDrag);
+                document.removeEventListener('touchmove', onDrag);
+                document.removeEventListener('mouseup', stopDrag);
+                document.removeEventListener('touchend', stopDrag);
+            };
+
+            this.el.header.addEventListener('mousedown', startDrag);
+            this.el.header.addEventListener('touchstart', startDrag, { passive: false });
+        },
+
+        init() {
+            const style = document.createElement('style');
+            style.textContent = `
+                @keyframes gradient-animation {
+                    0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; }
+                }
+                @keyframes answer-gradient {
+                    0% { background-position: 0% 50%; }
+                    50% { background-position: 100% 50%; }
+                    100% { background-position: 0% 50%; }
+                }
+                #olm-answers-container {
+                    position: fixed; top: 10px; right: 10px; width: 450px; max-height: 90vh;
+                    border: 1px solid #cccccc; border-radius: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+                    z-index: 10000; display: flex; flex-direction: column;
+                    font-size: 16px; overflow: hidden;
+                    color: #333;
+                    background: linear-gradient(270deg, #e0f7fa, #d1c4e9, #fce4ec, #e0f7fa);
+                    background-size: 400% 400%; animation: gradient-animation 4s ease infinite;
+                    backdrop-filter: blur(5px);
+                    -webkit-backdrop-filter: blur(5px);
+                    touch-action: none;
+                    user-select: none;
+                }
+                #olm-answers-container.dragging,
+                #olm-answers-container.resizing {
+                    transition: none !important;
+                    cursor: grabbing !important;
+                }
+                .olm-answers-header {
+                    padding: 10px 15px; background-color: rgba(255, 255, 255, 0.4); border-bottom: 1px solid #cccccc;
+                    cursor: move !important; user-select: none; font-weight: bold; text-align: center;
+                    backdrop-filter: blur(8px);
+                    -webkit-backdrop-filter: blur(8px);
+                    color: #000;
+                }
+                #olm-answers-content {
+                    padding: 10px; margin: 0; flex-grow: 1; overflow-y: auto; background-color: rgba(255, 255, 255, 0.8);
+                }
+                #olm-answers-footer {
+                    padding: 8px; background-color: rgba(255, 255, 255, 0.4); border-top: 1px solid #cccccc; text-align: center;
+                    backdrop-filter: blur(8px);
+                }
+                #olm-dl-word {
+                    padding: 8px 16px; border: none; background-color: #28a745; color: white;
+                    border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s, transform 0.1s;
+                    font-size: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+                }
+                #olm-dl-word:hover { background-color: #218838; transform: translateY(-1px); }
+                #olm-dl-word:disabled { background-color: #9e9e9e; cursor: not-allowed; transform: none; }
+
+                #olm-answers-content::-webkit-scrollbar { width: 8px; }
+                #olm-answers-content::-webkit-scrollbar-track { background: #f1f1f1; }
+                #olm-answers-content::-webkit-scrollbar-thumb { background: #888; border-radius: 4px; }
+                #olm-answers-content::-webkit-scrollbar-thumb:hover { background: #555; }
+
+                .olm-highlight {
+                    background-color: rgba(255, 255, 0, 0.4) !important;
+                    outline: 2px solid #ffd700 !important;
+                    outline-offset: 2px;
+                    transition: all 0.3s ease;
+                }
+                .olm-item{
+                    background:#f8f8f8;
+                    border-left:3px solid #007bff;
+                    padding:10px;
+                    border-radius:0 6px 6px 0;
+                    margin-bottom:12px;
+                    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                }
+                .olm-item .question-content {
+                    font-weight: bold;
+                    color: #0056b3;
+                    margin-bottom: 8px;
+                }
+                .olm-item .content-container {
+                    padding: 8px 0 0 15px;
+                    border-top: 1px dashed #e0e0e0;
+                    margin-top: 8px;
+                }
+                .olm-item .content-container[data-type="solution"] {
+                    color: #28a745;
+                }
+                .olm-item .content-container[data-type="not-found"] {
+                    color: #777; font-style: italic;
+                }
+
+                .olm-item .content-container[data-type="answer"] {
+                    font-size: 1.35em !important;
+                    font-weight: 800 !important;
+                    color: white !important;
+                    padding: 12px 16px !important;
+                    border-radius: 8px !important;
+                    margin: 10px 0 !important;
+                    text-shadow: 0 1px 3px rgba(0,0,0,0.3);
+                    background: linear-gradient(45deg, #56ab2f, #4facfe, #00c9ff, #56ab2f);
+                    background-size: 300% 300% !important;
+                    animation: answer-gradient 6s ease infinite !important;
+                    box-shadow: 0 4px 12px rgba(86, 171, 47, 0.3) !important;
+                    border: 1px solid rgba(255,255,255,0.3);
+                    backdrop-filter: blur(2px);
+                    -webkit-backdrop-filter: blur(2px);
+                }
+
+                .olm-item img{max-width:100%;height:auto;}
+                .olm-item li.correctAnswer{color:#48bb78;font-weight:600}
+                .olm-item .fill-answer{color:#48bb78}
+                .olm-item [dir="ltr"]{cursor:pointer;transition:background 0.2s;padding:2px;border-radius:3px}
+                .olm-item [dir="ltr"]:hover{background:#d0eaff}
+                .olm-item ol.quiz-list{margin:0 0 6px 20px;padding:0}
+
+                .olm-mini-resize {
+                    position: absolute;
+                    bottom: 0; right: 0;
+                    width: 36px; height: 36px;
+                    cursor: nwse-resize;
+                    opacity: 0.7;
+                    touch-action: none;
+                    -webkit-user-select: none;
+                    user-select: none;
+                    border-bottom-right-radius: 8px;
+                    overflow: hidden;
+                }
+                .olm-mini-resize::before,
+                .olm-mini-resize::after {
+                    content: '';
+                    position: absolute;
+                    width: 36px; height: 1px;
+                    background: #999;
+                    border-radius: 8px;
+                    transition: background 0.2s;
+                }
+                .olm-mini-resize::before {
+                    bottom: 12px; right: 1px;
+                    transform: rotate(135deg);
+                }
+                .olm-mini-resize::after {
+                    bottom: 1px; right: 1px;
+                    transform: rotate(135deg);
+                }
+                .olm-mini-resize:hover::before,
+                .olm-mini-resize:hover::after {
+                    background: #555;
+                }
+                .olm-mini-resize:hover,
+                .olm-mini-resize:active {
+                    opacity: 1;
+                }
+
+                #olm-toggle-float {
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                    width: 40px;
+                    height: 40px;
+                    background: linear-gradient(135deg, #9c27b0, #673ab7, #311b92, #000000, #673ab7, #9c27b0);
+                    background-size: 300% 300%;
+                    border: 1px solid rgba(255, 255, 255, 0.2);
+                    border-radius: 8px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 14px;
+                    font-weight: bold;
+                    color: white;
+                    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+                    cursor: pointer;
+                    z-index: 9999;
+                    transition: all 0.3s ease;
+                    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+                    backdrop-filter: blur(6px);
+                    -webkit-backdrop-filter: blur(6px);
+                    user-select: none;
+                    animation: gradient-flow 4s ease infinite;
+                }
+
+                #olm-toggle-float:hover {
+                    transform: scale(1.1) translateY(-2px);
+                    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+                    background-size: 400% 400%;
+                }
+
+                #olm-toggle-float:active {
+                    transform: scale(0.98);
+                }
+
+                @keyframes gradient-flow {
+                    0% { background-position: 0% 50%; }
+                    50% { background-position: 100% 50%; }
+                    100% { background-position: 0% 50%; }
+                }
+            `;
+            document.head.appendChild(style);
+
+            const panel = document.createElement('div');
+            panel.id = 'olm-answers-container';
+            panel.innerHTML = `
+              <div class="olm-answers-header">
+                OLM Helper (Shift phải/nút để ẩn/hiện)
+              </div>
+              <div id="olm-answers-content"><div>Không có dữ liệu. Bắt đầu một bài tập hoặc trắc nghiệm.</div></div>
+              <div id="olm-answers-footer">
+                <button id="olm-dl-word">Tải đáp án (Word)</button>
+              </div>
+            `;
+            document.body.appendChild(panel);
+
+            const toggleBtn = document.createElement('div');
+            toggleBtn.id = 'olm-toggle-float';
+            document.body.appendChild(toggleBtn);
+
+            const resize = document.createElement('div');
+            resize.className = 'olm-mini-resize';
+            panel.appendChild(resize);
+
+            const saved = localStorage.getItem('olm-panel-size');
+            if (saved) {
+                try {
+                    const { w, h, x, y } = JSON.parse(saved);
+                    panel.style.width = `${w}px`;
+                    panel.style.height = `${h}px`;
+                    panel.style.left = `${x}px`;
+                    panel.style.top = `${y}px`;
+                    panel.style.right = 'auto';
+                    panel.style.bottom = 'auto';
+                    hasUserResized = true;
+                } catch(e) {}
+            }
+
+            window.addEventListener('keydown', (event) => {
+                if (event.code === 'ShiftRight') {
+                    ui.toggleVisibility();
+                }
+            });
+
+            this.el = {
+                panel,
+                header: panel.querySelector('.olm-answers-header'),
+                body: panel.querySelector('#olm-answers-content'),
+                dlWord: panel.querySelector('#olm-dl-word'),
+                resize,
+                toggleBtn
+            };
+
+            this.el.toggleBtn.addEventListener('click', () => {
+                ui.toggleVisibility();
+            });
+
+            this.updateToggleIcon = () => {
+                this.el.toggleBtn.innerHTML = state.isVisible
+                    ? '<span style="font-size:18px;">👀</span>'
+                    : '<span style="font-size:18px;">🎃</span>';
+            };
+            this.updateToggleIcon();
+
+            this.setupDrag();
+            this.setupResize();
+
+            this.el.dlWord.onclick = downloadWordFile;
+
+            this.el.body.addEventListener('click', (e) => {
+                const ltrEl = e.target.closest('[dir="ltr"]');
+                if (!ltrEl) return;
+                const itemEl = ltrEl.closest('.olm-item');
+                if (!itemEl) return;
+                e.stopPropagation();
+                const searchText = ltrEl.textContent.trim();
+                if (!searchText) return;
+                const matchEl = fuzzyMatch.findBestMatch(searchText);
+                if (matchEl) {
+                    scrollToElement(matchEl);
+                } else {
+                    const origBg = ltrEl.style.backgroundColor;
+                    ltrEl.style.backgroundColor = 'rgba(255, 136, 136, 0.3)';
+                    setTimeout(() => { ltrEl.style.backgroundColor = origBg; }, 300);
+                }
+            });
+
+            const adjustForMobile = () => {
+                if (window.innerWidth > 768) return;
+                if (hasUserResized) return;
+
+                panel.style.width = `${Math.min(450, window.innerWidth * 0.92)}px`;
+                panel.style.height = `${window.innerHeight * 0.75}px`;
+                panel.style.left = `${(window.innerWidth - panel.offsetWidth) / 2}px`;
+                panel.style.top = `${window.innerHeight * 0.1}px`;
+                panel.style.right = 'auto';
+                panel.style.bottom = 'auto';
+            };
+            setTimeout(adjustForMobile, 500);
+            window.addEventListener('resize', adjustForMobile);
+            window.addEventListener('orientationchange', adjustForMobile);
+        },
+
+        toggleVisibility() {
+            state.isVisible = !state.isVisible;
+            this.el.panel.style.display = state.isVisible ? 'flex' : 'none';
+            this.updateToggleIcon();
+            if (state.isVisible) {
+                this.update();
+            }
+        },
+
+        update() {
+            if (!this.el.body) return;
+            if (!state.items.length) {
+                this.el.body.innerHTML = '<div>Không có dữ liệu. Bắt đầu một bài tập hoặc trắc nghiệm.</div>';
+                return;
+            }
+            const renderSegment = (html) => {
+                const tmp = document.createElement('div');
+                tmp.innerHTML = html;
+                if (!tmp.querySelector('li.correctAnswer')) {
+                    tmp.querySelectorAll('input[data-accept]').forEach(inp => {
+                        const v = inp.getAttribute('data-accept') || '';
+                        const span = document.createElement('span');
+                        span.className = 'fill-answer';
+                        span.textContent = v;
+                        inp.replaceWith(span);
+                    });
+                }
+                return tmp.innerHTML;
+            };
+            this.el.body.innerHTML = state.items.map((html, i) => `
+                <div class="olm-item">
+                    <div style="opacity:.7;margin-bottom:4px; font-size: 13px; color: #555;">Câu ${i+1}</div>
+                    ${renderSegment(html)}
+                </div>
+            `).join('');
+            ensureMathJax().then(() => {
+                try {
+                    window.MathJax.typesetPromise && window.MathJax.typesetPromise([this.el.body]);
+                } catch {}
+            });
+        }
+    };
+
+    const onReady = () => ui.init();
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onReady);
+    else onReady();
+})();
